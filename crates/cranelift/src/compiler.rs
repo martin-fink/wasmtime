@@ -152,6 +152,9 @@ impl wasmtime_environ::Compiler for Compiler {
         if self.tunables.generate_native_debuginfo {
             context.func.collect_debug_info();
         }
+        // Enable the verifier for wasm functions
+        // Note that this doesn't actually do anything, unless the cranelift setting `enable_mem_verifier` is also set.
+        context.func.mem_verifier.enabled = true;
 
         let mut func_env =
             FuncEnvironment::new(isa, translation, types, &self.tunables, self.wmemcheck);

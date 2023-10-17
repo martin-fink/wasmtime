@@ -47,7 +47,7 @@ pub fn first_user_vreg_index() -> usize {
 /// `Operand`s.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-pub struct Reg(VReg);
+pub struct Reg(pub(crate) VReg); // TODO: find out if we can remove this pub crate again
 
 impl Reg {
     /// Get the physical register (`RealReg`), if this register is

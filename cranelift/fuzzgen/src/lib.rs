@@ -239,6 +239,7 @@ where
 
         // This is the default, but we should ensure that it wasn't accidentally turned off anywhere.
         builder.enable("enable_verifier")?;
+        builder.enable("enable_mem_verifier")?;
 
         // These settings just panic when they're not enabled and we try to use their respective functionality
         // so they aren't very interesting to be automatically generated.

@@ -111,3 +111,9 @@ name = "cranelift-icache"
 path = "fuzz_targets/cranelift-icache.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "compile-mem-verify"
+path = "fuzz_targets/compile-mem-verify.rs"
+test = false
+doc = false

@@ -19,6 +19,9 @@ use crate::ir::immediates::Imm64;
 use crate::ir::types::{self, I128, I64};
 use crate::ir::{self, InstBuilder, InstructionData, MemFlags, Value};
 use crate::isa::TargetIsa;
+use crate::mem_verifier::assertions::ValueAssertion;
+use crate::mem_verifier::constraint::ValueConstraint;
+use crate::mem_verifier::symbolic_value::SymbolicValue;
 use crate::trace;
 
 mod globalvalue;
@@ -353,4 +356,31 @@ fn expand_cond_trap(
     cfg.recompute_block(pos.func, old_block);
     cfg.recompute_block(pos.func, new_block_resume);
     cfg.recompute_block(pos.func, new_block_trap);
+
+    // Infer constraints based on the conditional trap
+    // We only do this if the trap is not resumable
+    if pos.func.mem_verifier.enabled && opcode != ir::Opcode::ResumableTrapnz {
+        let mut constraint = if trapz {
+            ValueConstraint::neq(SymbolicValue::Const(0))
+        } else {
+            ValueConstraint::eq(SymbolicValue::Const(0))
+        };
+
+        if let Some((_, existing)) = pos
+            .func
+            .mem_verifier
+            .block_assertions
+            .get(&old_block)
+            .iter()
+            .flat_map(|set| set.iter())
+            .find(|(value, _)| **value == arg.into())
+        {
+            constraint = constraint.clamp(&existing.constraint);
+        }
+        pos.func.add_block_assertion(
+            new_block_resume,
+            arg.into(),
+            ValueAssertion::new_assumption(constraint),
+        );
+    }
 }

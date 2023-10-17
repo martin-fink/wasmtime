@@ -163,6 +163,7 @@ where
                 self.value_to_opt_value[result] = orig_result;
                 self.eclasses.union(result, orig_result);
                 self.stats.union += 1;
+                self.combine_annotations(result, orig_result);
                 result
             } else {
                 orig_result
@@ -201,6 +202,23 @@ where
             self.value_to_opt_value[result] = opt_value;
             opt_value
         }
+    }
+
+    /// Combine the annotations of two values
+    fn combine_annotations(&mut self, value1: Value, value2: Value) {
+        if value1 == value2 {
+            return;
+        }
+
+        let annotation1 = self.func.mem_verifier.assertions.get(&value1.into());
+        let annotation2 = self.func.mem_verifier.assertions.get(&value2.into());
+
+        // Leaving a debug assertion so we get notified should this case ever happen
+        // We might not need to combine the annotations at all
+        debug_assert!(
+            annotation1.is_none() || annotation2.is_none(),
+            "Do we need to handle this?"
+        );
     }
 
     /// Optimizes an enode by applying any matching mid-end rewrite
@@ -274,6 +292,9 @@ where
                 .eclasses
                 .union(old_union_value, optimized_value);
             isle_ctx.ctx.eclasses.union(old_union_value, union_value);
+            isle_ctx
+                .ctx
+                .combine_annotations(old_union_value, union_value);
         }
 
         isle_ctx.ctx.rewrite_depth -= 1;

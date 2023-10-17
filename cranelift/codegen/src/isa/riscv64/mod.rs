@@ -22,7 +22,11 @@ mod settings;
 #[cfg(feature = "unwind")]
 use crate::isa::unwind::systemv;
 
+use crate::isa::riscv64::mem_verifier::Riscv64MemAccessVerifier;
+use inst::crate_reg_eviroment;
+
 use self::inst::EmitInfo;
+pub mod mem_verifier;
 
 /// An riscv64 backend.
 pub struct Riscv64Backend {
@@ -56,7 +60,10 @@ impl Riscv64Backend {
         let emit_info = EmitInfo::new(self.flags.clone(), self.isa_flags.clone());
         let sigs = SigSet::new::<abi::Riscv64MachineDeps>(func, &self.flags)?;
         let abi = abi::Riscv64Callee::new(func, self, &self.isa_flags, &sigs)?;
-        compile::compile::<Riscv64Backend>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
+        let verifier = Riscv64MemAccessVerifier::new();
+        compile::compile::<Riscv64Backend>(
+            func, domtree, self, abi, emit_info, sigs, ctrl_plane, &verifier,
+        )
     }
 }
 

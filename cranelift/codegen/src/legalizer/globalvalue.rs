@@ -6,6 +6,9 @@
 use crate::cursor::{Cursor, FuncCursor};
 use crate::ir::{self, InstBuilder};
 use crate::isa::TargetIsa;
+use crate::mem_verifier::assertions::ValueAssertion;
+use crate::mem_verifier::constraint::ValueConstraint;
+use crate::mem_verifier::symbolic_value::{SpecialValue, SymbolicValue};
 
 /// Expand a `global_value` instruction according to the definition of the global value.
 pub fn expand_global_value(
@@ -58,6 +61,8 @@ fn vmctx_addr(inst: ir::Inst, func: &mut ir::Function) {
         .special_param(ir::ArgumentPurpose::VMContext)
         .expect("Missing vmctx parameter");
 
+    add_vmctx_assertion(func);
+
     // Replace the `global_value` instruction's value with an alias to the vmctx arg.
     let result = func.dfg.first_result(inst);
     func.dfg.clear_results(inst);
@@ -78,6 +83,7 @@ fn iadd_imm_addr(
     // Get the value for the lhs. For tidiness, expand VMContext here so that we avoid
     // `vmctx_addr` which creates an otherwise unneeded value alias.
     let lhs = if let ir::GlobalValueData::VMContext = pos.func.global_values[base] {
+        add_vmctx_assertion(pos.func);
         pos.func
             .special_param(ir::ArgumentPurpose::VMContext)
             .expect("Missing vmctx parameter")
@@ -109,6 +115,7 @@ fn load_addr(
     // Get the value for the base. For tidiness, expand VMContext here so that we avoid
     // `vmctx_addr` which creates an otherwise unneeded value alias.
     let base_addr = if let ir::GlobalValueData::VMContext = pos.func.global_values[base] {
+        add_vmctx_assertion(pos.func);
         pos.func
             .special_param(ir::ArgumentPurpose::VMContext)
             .expect("Missing vmctx parameter")
@@ -144,4 +151,28 @@ fn symbol(
     } else {
         func.dfg.replace(inst).symbol_value(ptr_ty, gv);
     }
+}
+
+fn add_vmctx_assertion(func: &mut ir::Function) {
+    if !func.mem_verifier.enabled {
+        return;
+    }
+
+    let vmctx = func
+        .special_param(ir::ArgumentPurpose::VMContext)
+        .expect("Missing vmctx parameter");
+    let block = func
+        .layout
+        .entry_block()
+        .expect("Function has no entry block");
+    func.mem_verifier
+        .block_assertions
+        .entry(block)
+        .or_default()
+        .insert(
+            vmctx.into(),
+            ValueAssertion::new_assumption(ValueConstraint::eq(SymbolicValue::Special(
+                SpecialValue::VmCtx,
+            ))),
+        );
 }

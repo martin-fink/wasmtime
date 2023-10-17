@@ -73,6 +73,8 @@ define_passes! {
     vcode_emit: "VCode emission",
     vcode_emit_finish: "VCode emission finalization",
 
+    mem_verifier: "Memory access verifier",
+
     regalloc: "Register allocation",
     regalloc_checker: "Register allocation symbolic verification",
     layout_renumber: "Layout full renumbering",

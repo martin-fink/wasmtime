@@ -180,6 +180,7 @@ where
             let oob = builder
                 .ins()
                 .icmp(IntCC::UnsignedGreaterThan, adjusted_index, bound);
+
             Reachable(explicit_check_oob_condition_and_compute_addr(
                 &mut builder.cursor(),
                 heap,

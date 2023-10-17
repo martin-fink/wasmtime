@@ -16,24 +16,26 @@
 //!
 //! See the main module comment in `mod.rs` for more details on the VCode-based
 //! backend pipeline.
-
 use crate::fx::FxHashMap;
 use crate::fx::FxHashSet;
 use crate::ir::RelSourceLoc;
 use crate::ir::{self, types, Constant, ConstantData, DynamicStackSlot, ValueLabel};
 use crate::machinst::*;
+use crate::mem_verifier::assertions::{RegOrConst, ValueAssertion};
+use crate::mem_verifier::capability::MemoryAccessCapability;
+use crate::mem_verifier::constraint::ValueConstraint;
+use crate::mem_verifier::verifier::{Error, MemAccessVerifier, VerifierCtx};
 use crate::timing;
 use crate::trace;
 use crate::CodegenError;
 use crate::{LabelValueLoc, ValueLocRange};
+use alloc::vec::Vec;
 use cranelift_control::ControlPlane;
+use cranelift_entity::{entity_impl, Keys, PrimaryMap};
 use regalloc2::{
     Edit, Function as RegallocFunction, InstOrEdit, InstRange, MachineEnv, Operand, OperandKind,
-    PRegSet, RegClass, VReg,
+    PRegSet, RegClass,
 };
-
-use alloc::vec::Vec;
-use cranelift_entity::{entity_impl, Keys, PrimaryMap};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
@@ -148,7 +150,7 @@ pub struct VCode<I: VCodeInst> {
     /// Operands and branch arguments will already have been
     /// translated through this alias table; but it helps to make
     /// sense of instructions when pretty-printed, for example.
-    vreg_aliases: FxHashMap<regalloc2::VReg, regalloc2::VReg>,
+    pub(crate) vreg_aliases: FxHashMap<regalloc2::VReg, regalloc2::VReg>,
 
     /// Block-order information.
     block_order: BlockLoweringOrder,
@@ -171,7 +173,29 @@ pub struct VCode<I: VCodeInst> {
     /// Value labels for debuginfo attached to vregs.
     debug_value_labels: Vec<(VReg, InsnIndex, InsnIndex, u32)>,
 
+    mem_verifier: MemVerifierVCodeCtx,
+
     pub(crate) sigs: SigSet,
+}
+
+/// The context for the memory access verifier
+struct MemVerifierVCodeCtx {
+    /// Assertions for vreg definitions
+    assertions: FxHashMap<RegOrConst, ValueAssertion>,
+    /// Assertions for blocks
+    block_assertions: FxHashMap<BlockIndex, FxHashMap<RegOrConst, ValueAssertion>>,
+    /// Ambient capabilities, e.g. for stack accesses
+    ambient_capabilities: Vec<MemoryAccessCapability>,
+}
+
+impl MemVerifierVCodeCtx {
+    fn new() -> Self {
+        Self {
+            assertions: FxHashMap::default(),
+            block_assertions: FxHashMap::default(),
+            ambient_capabilities: Vec::default(),
+        }
+    }
 }
 
 /// The result of `VCode::emit`. Contains all information computed
@@ -402,6 +426,31 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         labels.push((last, inst, reg.into()));
     }
 
+    /// Add an assertion to a register
+    pub fn add_assertion(&mut self, reg: Reg, assertion: &ValueAssertion) {
+        let overwritten_annotation = self.vcode.mem_verifier.assertions.insert(
+            self.resolve_vreg_alias(reg.into()).into(),
+            assertion.clone(),
+        );
+        debug_assert!(overwritten_annotation.is_none());
+    }
+
+    /// Add an assertion on a register to a block
+    pub fn add_block_assertions<Iter: IntoIterator<Item = (RegOrConst, ValueAssertion)>>(
+        &mut self,
+        block: BlockIndex,
+        assertions: Iter,
+    ) {
+        self.vcode.add_block_assertions(block, assertions);
+    }
+
+    pub fn add_ambient_capability(&mut self, capability: MemoryAccessCapability) {
+        self.vcode
+            .mem_verifier
+            .ambient_capabilities
+            .push(capability)
+    }
+
     pub fn set_vreg_alias(&mut self, from: Reg, to: Reg) {
         let from = from.into();
         let resolved_to = self.resolve_vreg_alias(to.into());
@@ -414,7 +463,22 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         Self::resolve_vreg_alias_impl(&self.vcode.vreg_aliases, from)
     }
 
-    fn resolve_vreg_alias_impl(
+    fn get_vreg_aliases_impl(
+        aliases: &FxHashMap<regalloc2::VReg, regalloc2::VReg>,
+        from: regalloc2::VReg,
+    ) -> Vec<regalloc2::VReg> {
+        let mut vreg = from;
+        let mut result = vec![vreg];
+
+        while let Some(to) = aliases.get(&vreg) {
+            result.push(*to);
+            vreg = *to;
+        }
+
+        result
+    }
+
+    pub(crate) fn resolve_vreg_alias_impl(
         aliases: &FxHashMap<regalloc2::VReg, regalloc2::VReg>,
         from: regalloc2::VReg,
     ) -> regalloc2::VReg {
@@ -654,6 +718,7 @@ impl<I: VCodeInst> VCode<I> {
             constants,
             debug_value_labels: vec![],
             vreg_aliases: FxHashMap::with_capacity_and_hasher(10 * n_blocks, Default::default()),
+            mem_verifier: MemVerifierVCodeCtx::new(),
         }
     }
 
@@ -677,6 +742,26 @@ impl<I: VCodeInst> VCode<I> {
     pub fn succs(&self, block: BlockIndex) -> &[BlockIndex] {
         let (start, end) = self.block_succ_range[block.index()];
         &self.block_succs_preds[start as usize..end as usize]
+    }
+
+    /// Get the operands
+    pub fn operands(&self) -> FxHashSet<VReg> {
+        self.operands
+            .iter()
+            .map(|o| self.assert_not_vreg_alias(o.vreg()))
+            .collect()
+    }
+
+    /// Set mem verifier block assertions
+    pub fn add_block_assertions<Iter: IntoIterator<Item = (RegOrConst, ValueAssertion)>>(
+        &mut self,
+        block: BlockIndex,
+        assertions: Iter,
+    ) {
+        let entry = self.mem_verifier.block_assertions.entry(block).or_default();
+        for (key, assertion) in assertions {
+            entry.entry(key).or_insert(assertion);
+        }
     }
 
     fn compute_clobbers(&self, regalloc: &regalloc2::Output) -> Vec<Writable<RealReg>> {
@@ -1277,6 +1362,209 @@ impl<I: VCodeInst> VCode<I> {
         self.assert_not_vreg_alias(op.vreg());
         op
     }
+
+    fn get_block_constraints(&self, block: BlockIndex) -> Vec<(RegOrConst, ValueConstraint)> {
+        let mut constraints = vec![];
+
+        if let Some(assumptions) = self.mem_verifier.block_assertions.get(&block) {
+            for (vreg, assumption) in assumptions {
+                let key = match vreg {
+                    RegOrConst::Reg(vreg) => {
+                        VCodeBuilder::<I>::resolve_vreg_alias_impl(&self.vreg_aliases, *vreg).into()
+                    }
+                    key => *key,
+                };
+                constraints.push((key, assumption.constraint.clone()));
+            }
+        }
+
+        constraints
+    }
+
+    pub fn verify_memory_accesses<'a, It: IntoIterator<Item = &'a MemoryAccessCapability>>(
+        &'a self,
+        mem_verifier: &'a dyn MemAccessVerifier<I>,
+        capabilities: It,
+    ) -> Result<(), Error> {
+        let capabilities = capabilities
+            .into_iter()
+            .chain(self.mem_verifier.ambient_capabilities.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let def_map = {
+            let mut def_map: HashMap<VReg, InsnIndex> = HashMap::default();
+
+            for i in 0..self.insts.len() {
+                let inst = InsnIndex::new(i);
+                let operands = self.inst_operands(inst);
+
+                operands
+                    .iter()
+                    .filter(|op| op.kind() == OperandKind::Def)
+                    .map(|op| op.vreg())
+                    .for_each(|reg| {
+                        def_map.insert(reg, inst);
+                    })
+            }
+
+            def_map
+        };
+
+        for block in 0..self.num_blocks() {
+            let block = BlockIndex::new(block);
+            // We assume assertions on this block to be true
+            let mut verified_constraints = FxHashMap::default();
+
+            // if our block has a single successor, get it's outgoing constraints and use them
+            let preds = self.block_preds(block);
+            if preds.len() == 1 {
+                let bindex = preds[0];
+                let terminator = self.block_insns(bindex).last();
+
+                // We only use constraints defined on the predecessor, we don't do this analysis further back.
+                // This should be enough for the code cranelift generates.
+                let pred_verified_constraints = {
+                    let mut constraints = FxHashMap::default();
+                    for (key, constraint) in self.get_block_constraints(bindex) {
+                        constraints.insert(key, constraint.clone());
+                    }
+
+                    constraints
+                };
+
+                let incoming_constraints = mem_verifier.get_outgoing_constraints(
+                    terminator,
+                    VerifierCtx {
+                        insts: &self.insts,
+                        def_map: &def_map,
+                        vreg_aliases: &self.vreg_aliases,
+                        verified_constraints: &pred_verified_constraints,
+                        constants: &self.constants,
+                    },
+                )?;
+
+                let pred_succs = self.block_succs(bindex);
+                debug_assert_eq!(incoming_constraints.len(), pred_succs.len());
+
+                if let Some(constraints) = pred_succs
+                    .iter()
+                    .zip(incoming_constraints.into_iter())
+                    .find(|(bindex, _)| **bindex == block)
+                    .map(|(_, constraints)| constraints)
+                {
+                    for (key, constraint) in constraints {
+                        verified_constraints.insert(key, constraint);
+                    }
+                }
+            }
+
+            for (key, constraint) in self.get_block_constraints(block) {
+                verified_constraints.insert(key, constraint);
+            }
+
+            let insts = self.block_insns(block);
+
+            for inst in insts.iter() {
+                // First we validate any assertions on defined values
+                for vreg in self
+                    .inst_operands(inst)
+                    .iter()
+                    .filter(|op| op.kind() == OperandKind::Def)
+                    .map(|op| op.vreg())
+                {
+                    let vreg = self.assert_not_vreg_alias(vreg);
+                    if let Some(annotation) = self.mem_verifier.assertions.get(&vreg.into()) {
+                        // if the annotation is an assertion, we check it. Otherwise, we just insert it into our
+                        // verified constraints.
+                        eprintln!("annotation is assertion: {}", annotation.is_assertion());
+                        if annotation.is_assertion() {
+                            mem_verifier.verify_reg_assertion(
+                                vreg,
+                                annotation,
+                                VerifierCtx {
+                                    insts: &self.insts,
+                                    def_map: &def_map,
+                                    vreg_aliases: &self.vreg_aliases,
+                                    verified_constraints: &verified_constraints,
+                                    constants: &self.constants,
+                                },
+                            )?;
+                        }
+
+                        verified_constraints.insert(vreg.into(), annotation.constraint.clone());
+                    }
+                }
+
+                // Then we check that memory access performed by this inst only accesses memory allowed by
+                // capabilities
+                mem_verifier.verify_memory_access(
+                    &self.insts[inst.0 as usize],
+                    &capabilities,
+                    VerifierCtx {
+                        insts: &self.insts,
+                        def_map: &def_map,
+                        vreg_aliases: &self.vreg_aliases,
+                        verified_constraints: &verified_constraints,
+                        constants: &self.constants,
+                    },
+                )?;
+            }
+
+            // Lastly, we verify that now any assertion on successor blocks holds as well
+
+            // first, get map of block -> outgoing constraints
+            // then, for each block, merge verified_constraints with the constraints for that block
+            // then, check if all assertions hold
+            let succs_constraints = mem_verifier.get_outgoing_constraints(
+                self.block_insns(block).last(),
+                VerifierCtx {
+                    insts: &self.insts,
+                    def_map: &def_map,
+                    vreg_aliases: &self.vreg_aliases,
+                    verified_constraints: &verified_constraints,
+                    constants: &self.constants,
+                },
+            )?;
+
+            assert_eq!(succs_constraints.len(), self.block_succs(block).len());
+            for (succ, mut constraints) in self.block_succs(block).iter().zip(succs_constraints) {
+                for (vreg, assertion) in self
+                    .mem_verifier
+                    .block_assertions
+                    .get(&succ)
+                    .iter()
+                    .flat_map(|a| a.iter())
+                    .filter(|(_, assertion)| assertion.is_assertion())
+                {
+                    for (reg, constraint) in verified_constraints.iter() {
+                        // only insert if we don't have a constraint already
+                        constraints
+                            .entry(*reg)
+                            .or_insert_with(|| constraint.clone());
+                    }
+                    // If we encounter a constant key, we ignore it; there should be a corresponding assertion on the
+                    // register anyway, so this is safe to ignore.
+                    if let RegOrConst::Reg(vreg) = vreg {
+                        mem_verifier.verify_reg_assertion(
+                            // we don't need to check for register aliases here, as the mem_verifier does that
+                            *vreg,
+                            assertion,
+                            VerifierCtx {
+                                insts: &self.insts,
+                                def_map: &def_map,
+                                vreg_aliases: &self.vreg_aliases,
+                                verified_constraints: &constraints,
+                                constants: &self.constants,
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<I: VCodeInst> RegallocFunction for VCode<I> {
@@ -1416,6 +1704,11 @@ impl<I: VCodeInst> fmt::Debug for VCode<I> {
             }
             for succ in self.succs(block) {
                 writeln!(f, "    (successor: Block {})", succ.index())?;
+            }
+            if let Some(assertions) = self.mem_verifier.block_assertions.get(&block) {
+                for (reg, assertion) in assertions {
+                    writeln!(f, "    {}", assertion.display(reg))?;
+                }
             }
             let (start, end) = self.block_ranges[block.index()];
             writeln!(

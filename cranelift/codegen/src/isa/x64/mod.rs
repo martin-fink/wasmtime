@@ -7,6 +7,7 @@ use crate::dominator_tree::DominatorTree;
 use crate::ir::{types, Function, Type};
 #[cfg(feature = "unwind")]
 use crate::isa::unwind::systemv;
+use crate::isa::x64::mem_verifier::X64MemAccessVerifier;
 use crate::isa::x64::settings as x64_settings;
 use crate::isa::{Builder as IsaBuilder, FunctionAlignment};
 use crate::machinst::{
@@ -24,6 +25,7 @@ mod abi;
 pub mod encoding;
 mod inst;
 mod lower;
+pub mod mem_verifier;
 pub mod settings;
 
 /// An X64 backend.
@@ -54,7 +56,10 @@ impl X64Backend {
         let emit_info = EmitInfo::new(self.flags.clone(), self.x64_flags.clone());
         let sigs = SigSet::new::<abi::X64ABIMachineSpec>(func, &self.flags)?;
         let abi = abi::X64Callee::new(func, self, &self.x64_flags, &sigs)?;
-        compile::compile::<Self>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
+        let verifier = X64MemAccessVerifier;
+        compile::compile::<Self>(
+            func, domtree, self, abi, emit_info, sigs, ctrl_plane, &verifier,
+        )
     }
 }
 

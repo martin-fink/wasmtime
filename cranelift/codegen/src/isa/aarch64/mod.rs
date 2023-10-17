@@ -21,7 +21,11 @@ use target_lexicon::{Aarch64Architecture, Architecture, OperatingSystem, Triple}
 mod abi;
 pub mod inst;
 mod lower;
+pub mod mem_verifier;
 pub mod settings;
+
+use crate::isa::aarch64::mem_verifier::AArch64MemAccessVerifier;
+use inst::create_reg_env;
 
 use self::inst::EmitInfo;
 
@@ -57,7 +61,10 @@ impl AArch64Backend {
         let emit_info = EmitInfo::new(self.flags.clone());
         let sigs = SigSet::new::<abi::AArch64MachineDeps>(func, &self.flags)?;
         let abi = abi::AArch64Callee::new(func, self, &self.isa_flags, &sigs)?;
-        compile::compile::<AArch64Backend>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
+        let verifier = AArch64MemAccessVerifier::new();
+        compile::compile::<AArch64Backend>(
+            func, domtree, self, abi, emit_info, sigs, ctrl_plane, &verifier,
+        )
     }
 }
 

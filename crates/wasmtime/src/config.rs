@@ -915,6 +915,24 @@ impl Config {
         self
     }
 
+    /// Configures whether the mem verifier of Cranelift is enabled or not.
+    ///
+    /// When Cranelift is used as a code generation backend this will configure
+    /// it to have the `enable_mem_verifier` flag which will enable a number of debug
+    /// checks inside of Cranelift. This is largely only useful for the
+    /// developers of wasmtime itself.
+    ///
+    /// The default value for this is `false`
+    #[cfg(any(feature = "cranelift", feature = "winch"))]
+    #[cfg_attr(nightlydoc, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
+    pub fn cranelift_mem_verifier(&mut self, enable: bool) -> &mut Self {
+        let val = if enable { "true" } else { "false" };
+        self.compiler_config
+            .settings
+            .insert("enable_mem_verifier".to_string(), val.to_string());
+        self
+    }
+
     /// Configures the Cranelift code generator optimization level.
     ///
     /// When the Cranelift code generator is used you can configure the

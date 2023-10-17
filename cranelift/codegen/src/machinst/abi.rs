@@ -107,6 +107,10 @@ use crate::fx::FxHashMap;
 use crate::ir::types::*;
 use crate::ir::{ArgumentExtension, ArgumentPurpose, DynamicStackSlot, Signature, StackSlot};
 use crate::isa::TargetIsa;
+use crate::mem_verifier::assertions::ValueAssertion;
+use crate::mem_verifier::capability::MemoryAccessCapability;
+use crate::mem_verifier::constraint::ValueConstraint;
+use crate::mem_verifier::symbolic_value::{SpecialValue, SymbolicValue};
 use crate::settings;
 use crate::settings::ProbestackStrategy;
 use crate::{ir, isa};
@@ -1703,11 +1707,17 @@ impl<M: ABIMachineSpec> Callee<M> {
     /// values or an otherwise large return value that must be passed on the
     /// stack; typically the ABI specifies an extra hidden argument that is a
     /// pointer to that memory.
+    /// If the memory access verifier is enabled, we also create a new ambient
+    /// capability and assumptions about the register holding the ret_area_ptr.
     pub fn gen_retval_area_setup(
         &mut self,
         sigs: &SigSet,
         vregs: &mut VRegAllocator<M::I>,
-    ) -> Option<M::I> {
+        func: &ir::Function,
+    ) -> (
+        Option<M::I>,
+        Option<(Reg, ValueAssertion, MemoryAccessCapability)>,
+    ) {
         if let Some(i) = sigs[self.sig].stack_ret_arg {
             let insts = self.gen_copy_arg_to_regs(
                 sigs,
@@ -1715,17 +1725,37 @@ impl<M: ABIMachineSpec> Callee<M> {
                 ValueRegs::one(self.ret_area_ptr.unwrap()),
                 vregs,
             );
-            insts.into_iter().next().map(|inst| {
+
+            let mem_verifier_data = if func.mem_verifier.enabled {
+                // Since the function will return values at an area pointed to by a hidden argument passed by the
+                // caller, we need to add a capability to access that area. Additionally, we add an assertion to the
+                // first block that the last argument is ret_area_ptr.
+                let capability = MemoryAccessCapability::new(
+                    SymbolicValue::Special(SpecialValue::RetAreaPtr),
+                    SymbolicValue::Const(sigs[self.sig].sized_stack_ret_space.into()),
+                    "ret_area",
+                );
+                let assertion = ValueAssertion::new_assumption(ValueConstraint::eq(
+                    SymbolicValue::Special(SpecialValue::RetAreaPtr),
+                ));
+                Some((self.ret_area_ptr.unwrap().to_reg(), assertion, capability))
+            } else {
+                None
+            };
+
+            let inst = insts.into_iter().next().map(|inst| {
                 trace!(
                     "gen_retval_area_setup: inst {:?}; ptr reg is {:?}",
                     inst,
                     self.ret_area_ptr.unwrap().to_reg()
                 );
                 inst
-            })
+            });
+
+            (inst, mem_verifier_data)
         } else {
             trace!("gen_retval_area_setup: not needed");
-            None
+            (None, None)
         }
     }
 

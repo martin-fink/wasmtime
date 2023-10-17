@@ -8,6 +8,10 @@ use cranelift_codegen::ir::{
     AbiParam, ArgumentPurpose, Function, InstBuilder, Signature, UserFuncName, Value,
 };
 use cranelift_codegen::isa::{self, CallConv, TargetFrontendConfig, TargetIsa};
+use cranelift_codegen::mem_verifier::assertions::ValueAssertion;
+use cranelift_codegen::mem_verifier::capability::MemoryAccessCapability;
+use cranelift_codegen::mem_verifier::constraint::ValueConstraint;
+use cranelift_codegen::mem_verifier::symbolic_value::{SpecialValue, SymbolicValue};
 use cranelift_entity::{EntityRef, PrimaryMap};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_frontend::Variable;
@@ -213,6 +217,13 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         self.vmctx.unwrap_or_else(|| {
             let vmctx = func.create_global_value(ir::GlobalValueData::VMContext);
             self.vmctx = Some(vmctx);
+
+            func.add_capability(MemoryAccessCapability::new(
+                SymbolicValue::Special(SpecialValue::VmCtx),
+                SymbolicValue::Const(self.offsets.size_of_vmctx().into()),
+                "vmctx",
+            ));
+
             vmctx
         })
     }
@@ -300,11 +311,28 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         let array_offset = i32::try_from(self.offsets.vmctx_builtin_functions()).unwrap();
         let array_addr = pos.ins().load(pointer_type, mem_flags, base, array_offset);
 
+        pos.func.add_capability(MemoryAccessCapability::new(
+            SymbolicValue::Special(SpecialValue::VmCtx)
+                .offset_const(array_offset.into())
+                .load(),
+            SymbolicValue::Const(self.pointer_bytes().into()),
+            "builtin_func_array",
+        ));
+
         // Load the callee address.
         let body_offset = i32::try_from(callee_func_idx.index() * pointer_type.bytes()).unwrap();
         let func_addr = pos
             .ins()
             .load(pointer_type, mem_flags, array_addr, body_offset);
+
+        pos.func.add_capability(MemoryAccessCapability::new(
+            SymbolicValue::Special(SpecialValue::VmCtx)
+                .offset_const(array_offset.into())
+                .load()
+                .offset_const(body_offset.into()),
+            SymbolicValue::Const(self.pointer_bytes().into()),
+            "builtin_func_addr",
+        ));
 
         (base, func_addr)
     }
@@ -354,6 +382,12 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
                 global_type: pointer_type,
                 readonly: true,
             });
+            let cap_begin = SymbolicValue::from_global_value(func, global);
+            func.add_capability(MemoryAccessCapability::new(
+                cap_begin,
+                SymbolicValue::Const(self.pointer_bytes().into()),
+                "global",
+            ));
             (global, 0)
         }
     }
@@ -878,6 +912,40 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         builder.seal_block(continuation_block);
 
         builder.switch_to_block(continuation_block);
+
+        if builder.func.mem_verifier.enabled {
+            let table = &builder.func.tables[table];
+
+            let table_base = SymbolicValue::from_global_value(builder.func, table.base_gv);
+            let table_bound = table_base.clone().offset(
+                SymbolicValue::from_global_value(builder.func, table.bound_gv)
+                    .offset_const_neg(1) // since we have at least one element
+                    .scaled(u64::from(table.element_size)),
+            );
+            let table_elem_base = table_base.bound_upper(table_bound).load();
+            let table_elem_bound = SymbolicValue::Const((8 * self.pointer_bytes()).into());
+
+            let func_ref_addr = SymbolicValue::either(
+                SymbolicValue::Const(0),
+                SymbolicValue::bounded(
+                    table_elem_base.clone(),
+                    table_elem_base.clone().offset(table_elem_bound.clone()),
+                ),
+            );
+            // we assume that the value returned from the lazy_init_func and the masked value are valid func refs
+            builder.func.add_block_assertion(
+                continuation_block,
+                result_param.into(),
+                ValueAssertion::new_assumption(ValueConstraint::eq(func_ref_addr)),
+            );
+
+            builder.func.add_capability(MemoryAccessCapability::new(
+                table_elem_base.clone(),
+                table_elem_bound.clone(),
+                "func_ref_table_elem",
+            ));
+        }
+
         result_param
     }
 
@@ -1076,6 +1144,26 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
                     i32::from(self.env.offsets.ptr.vm_func_ref_type_index()),
                 );
 
+                if self.builder.func.mem_verifier.enabled {
+                    let cap_size = self
+                        .env
+                        .module
+                        .types
+                        .len()
+                        .checked_mul(sig_id_type.bytes() as usize)
+                        .unwrap() as i64;
+                    // add capabilities for loading the signature and type
+                    self.builder
+                        .func
+                        .add_capability(MemoryAccessCapability::new(
+                            SymbolicValue::Special(SpecialValue::VmCtx)
+                                .offset_const(self.env.offsets.vmctx_signature_ids_array().into())
+                                .load(),
+                            SymbolicValue::Const(cap_size),
+                            "signature_ids_ptr",
+                        ));
+                }
+
                 // Check that they match.
                 let cmp = self
                     .builder
@@ -1266,6 +1354,27 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
             self.reference_type(self.module.table_plans[index].table.wasm_ty.heap_type)
                 .bytes(),
         );
+
+        if func.mem_verifier.enabled {
+            let cap_begin =
+                SymbolicValue::from_global_value(func, ptr).offset_const(base_offset.into());
+            func.add_capability(MemoryAccessCapability::new(
+                cap_begin,
+                SymbolicValue::Const(2 * i64::from(self.pointer_bytes())),
+                "table_ptr",
+            ));
+
+            let cap_begin = SymbolicValue::from_global_value(func, base_gv);
+            let cap_end = SymbolicValue::from_global_value(func, bound_gv)
+                .scaled(element_size.try_into().unwrap());
+            // the table is not empty, it has at least one pointer (8 bytes) in it.
+            func.add_capability(MemoryAccessCapability::with_min_size(
+                cap_begin,
+                cap_end,
+                "table",
+                element_size.try_into().unwrap(),
+            ));
+        }
 
         Ok(func.create_table(ir::TableData {
             base_gv,
@@ -1806,42 +1915,76 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
             }
         };
 
+        let mut add_capability = |ptr, offset: i32, size: i32, name| {
+            let cap_begin = SymbolicValue::from_global_value(func, ptr).offset_const(offset.into());
+            func.add_capability(MemoryAccessCapability::new(
+                cap_begin,
+                SymbolicValue::Const(size.into()),
+                name,
+            ));
+        };
+        if current_length_offset == base_offset + 8 {
+            add_capability(ptr, base_offset, 16, "heap_base_bound");
+        } else {
+            add_capability(ptr, base_offset, 8, "heap_base");
+            add_capability(ptr, current_length_offset, 8, "heap_bound");
+        }
+
         // If we have a declared maximum, we can make this a "static" heap, which is
         // allocated up front and never moved.
-        let (offset_guard_size, heap_style, readonly_base) = match self.module.memory_plans[index] {
-            MemoryPlan {
-                style: MemoryStyle::Dynamic { .. },
-                offset_guard_size,
-                pre_guard_size: _,
-                memory: _,
-            } => {
-                let heap_bound = func.create_global_value(ir::GlobalValueData::Load {
-                    base: ptr,
-                    offset: Offset32::new(current_length_offset),
-                    global_type: pointer_type,
-                    readonly: false,
-                });
-                (
+        let (offset_guard_size, heap_style, readonly_base, bound) =
+            match self.module.memory_plans[index] {
+                MemoryPlan {
+                    style: MemoryStyle::Dynamic { .. },
                     offset_guard_size,
-                    HeapStyle::Dynamic {
-                        bound_gv: heap_bound,
+                    pre_guard_size: _,
+                    memory: _,
+                } => {
+                    let heap_bound = func.create_global_value(ir::GlobalValueData::Load {
+                        base: ptr,
+                        offset: Offset32::new(current_length_offset),
+                        global_type: pointer_type,
+                        readonly: false,
+                    });
+                    // TODO: do we need this?
+                    // // we allow the code to read the heap_bound
+                    // let cap_begin = SymbolicValue::from_global_value(func, ptr)
+                    //     .offset_const(current_length_offset.into());
+                    // func.add_capability(MemoryAccessCapability::new(
+                    //     cap_begin,
+                    //     // this needs to be 16 (and not 2 * pointer_type.size), since this refers to the pointer size of the
+                    //     // target we're compiling to, not the wasm pointer size.
+                    //     // 16 since this pointer points to heap_base and heap_bound
+                    //     SymbolicValue::Const(16),
+                    //     "heap_bound",
+                    // ));
+                    (
+                        offset_guard_size,
+                        HeapStyle::Dynamic {
+                            bound_gv: heap_bound,
+                        },
+                        false,
+                        SymbolicValue::from_global_value(func, heap_bound),
+                    )
+                }
+                MemoryPlan {
+                    style: MemoryStyle::Static { bound },
+                    offset_guard_size,
+                    pre_guard_size: _,
+                    memory: _,
+                } => (
+                    offset_guard_size,
+                    HeapStyle::Static {
+                        bound: u64::from(bound) * u64::from(WASM_PAGE_SIZE),
                     },
-                    false,
-                )
-            }
-            MemoryPlan {
-                style: MemoryStyle::Static { bound },
-                offset_guard_size,
-                pre_guard_size: _,
-                memory: _,
-            } => (
-                offset_guard_size,
-                HeapStyle::Static {
-                    bound: u64::from(bound) * u64::from(WASM_PAGE_SIZE),
-                },
-                true,
-            ),
-        };
+                    true,
+                    SymbolicValue::Const(
+                        (u64::from(bound) * u64::from(WASM_PAGE_SIZE))
+                            .try_into()
+                            .unwrap(),
+                    ),
+                ),
+            };
 
         let heap_base = func.create_global_value(ir::GlobalValueData::Load {
             base: ptr,
@@ -1849,6 +1992,22 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
             global_type: pointer_type,
             readonly: readonly_base,
         });
+
+        let cap_begin = SymbolicValue::from_global_value(func, heap_base);
+        let cap_size = bound.offset_const(
+            offset_guard_size
+                .try_into()
+                .expect("offset does not fit into i64"),
+        );
+        if min_size > 0 {
+            func.add_capability(MemoryAccessCapability::new(
+                cap_begin.clone(),
+                SymbolicValue::Const(min_size as i64),
+                "heap_min_size",
+            ));
+        }
+        func.add_capability(MemoryAccessCapability::new(cap_begin, cap_size, "heap"));
+
         Ok(self.heaps.push(HeapData {
             base: heap_base,
             min_size,

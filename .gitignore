@@ -22,3 +22,6 @@ publish
 vendor
 examples/build
 *.coredump
+.idea
+tmp.txt
+*.cwasm

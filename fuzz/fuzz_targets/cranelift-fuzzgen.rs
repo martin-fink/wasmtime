@@ -377,6 +377,7 @@ fuzz_target!(|testcase: TestCase| {
 
     // This is the default, but we should ensure that it wasn't accidentally turned off anywhere.
     assert!(testcase.isa.flags().enable_verifier());
+    assert!(testcase.isa.flags().enable_mem_verifier());
 
     // Periodically print statistics
     let valid_inputs = STATISTICS.valid_inputs.fetch_add(1, Ordering::SeqCst);

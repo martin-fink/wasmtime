@@ -80,6 +80,8 @@ wasmtime_option_group! {
         pub compiler: Option<wasmtime::Strategy>,
         /// Enable Cranelift's internal debug verifier (expensive)
         pub cranelift_debug_verifier: Option<bool>,
+        /// Enable Cranelift's internal memory access verifier (expensive)
+        pub cranelift_mem_verifier: Option<bool>,
         /// Whether or not to enable caching of compiled modules.
         pub cache: Option<bool>,
         /// Configuration for compiled module caching.
@@ -346,6 +348,9 @@ impl CommonOptions {
 
         if let Some(enable) = self.codegen.cranelift_debug_verifier {
             config.cranelift_debug_verifier(enable);
+        }
+        if let Some(enable) = self.codegen.cranelift_mem_verifier {
+            config.cranelift_mem_verifier(enable);
         }
         if let Some(enable) = self.debug.debug_info {
             config.debug_info(enable);

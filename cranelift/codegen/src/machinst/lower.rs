@@ -5,6 +5,8 @@
 // TODO: separate the IR-query core of `Lower` from the lowering logic built on
 // top of it, e.g. the side-effect/coloring analysis and the scan support.
 
+use super::{VCodeBuildDirection, VRegAllocator};
+use crate::dominator_tree::DominatorTree;
 use crate::entity::SecondaryMap;
 use crate::fx::{FxHashMap, FxHashSet};
 use crate::inst_predicates::{has_lowering_side_effect, is_constant_64bit};
@@ -13,18 +15,20 @@ use crate::ir::{
     GlobalValue, GlobalValueData, Immediate, Inst, InstructionData, MemFlags, RelSourceLoc, Type,
     Value, ValueDef, ValueLabelAssignments, ValueLabelStart,
 };
+use crate::isa::TargetIsa;
 use crate::machinst::{
     writable_value_regs, BlockIndex, BlockLoweringOrder, Callee, LoweredBlock, MachLabel, Reg,
     SigSet, VCode, VCodeBuilder, VCodeConstant, VCodeConstantData, VCodeConstants, VCodeInst,
     ValueRegs, Writable,
 };
+use crate::mem_verifier::assertions::{RegOrConst, ValueAssertion, ValueOrConst};
 use crate::{trace, CodegenResult};
 use alloc::vec::Vec;
 use cranelift_control::ControlPlane;
+use regalloc2::Function as FuncIndex;
 use smallvec::{smallvec, SmallVec};
+use std::collections::VecDeque;
 use std::fmt::Debug;
-
-use super::{VCodeBuildDirection, VRegAllocator};
 
 /// A vector of ValueRegs, used to represent the outputs of an instruction.
 pub type InstOutput = SmallVec<[ValueRegs<Reg>; 2]>;
@@ -587,13 +591,22 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                     self.emit(insn);
                 }
             }
-            if let Some(insn) = self
-                .vcode
-                .vcode
-                .abi
-                .gen_retval_area_setup(&self.vcode.vcode.sigs, &mut self.vregs)
-            {
+            let (insn, mem_verifier_data) = self.vcode.vcode.abi.gen_retval_area_setup(
+                &self.vcode.vcode.sigs,
+                &mut self.vregs,
+                &mut self.f,
+            );
+            if let Some(insn) = insn {
                 self.emit(insn);
+            }
+            if let Some((reg, assertion, capability)) = mem_verifier_data {
+                self.vcode.add_ambient_capability(capability);
+                for bindex in 0..self.vcode.block_order().lowered_order().len() {
+                    self.vcode.add_block_assertions(
+                        BlockIndex::new(bindex),
+                        vec![(reg.into(), assertion.clone())],
+                    );
+                }
             }
 
             // The `args` instruction below must come first. Finish
@@ -766,6 +779,16 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                         self.set_vreg_alias(*dst, *temp);
                     }
                 }
+
+                debug_assert_eq!(temp_regs.len(), self.f.dfg.inst_results(inst).len());
+                for (i, val) in self.f.dfg.inst_results(inst).iter().enumerate() {
+                    if let Some(annotation) = self.f.mem_verifier.assertions.get(&(*val).into()) {
+                        let regs = temp_regs[i];
+                        for reg in regs.regs().iter() {
+                            self.vcode.add_assertion(*reg, annotation);
+                        }
+                    }
+                }
             }
 
             let loc = self.srcloc(inst);
@@ -798,6 +821,127 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
         self.cur_scan_entry_color = None;
         Ok(())
+    }
+
+    fn lower_block_assertions(
+        vcode: &mut VCode<I>,
+        f: &Function,
+        value_regs: &SecondaryMap<Value, ValueRegs<Reg>>,
+        lowered_order: SmallVec<[LoweredBlock; 64]>,
+        domtree: &DominatorTree,
+    ) {
+        let all_regs = vcode.operands();
+        let aliases = vcode.vreg_aliases.clone();
+
+        let get_ir_block = |block: BlockIndex| match lowered_order[block.index()] {
+            LoweredBlock::Orig { block } => block,
+            LoweredBlock::CriticalEdge { pred, .. } => pred,
+        };
+
+        for (bindex, _) in lowered_order.iter().enumerate().rev() {
+            let bindex = BlockIndex::new(bindex);
+            let mut assertions = Vec::new();
+
+            let mut worklist = VecDeque::new();
+            // We start with the current block and the entry block
+            // The entry block contains assumptions about special values such as vmctx or ret_area_ptr
+            worklist.push_back((bindex, 0));
+            worklist.push_back((vcode.entry_block(), 0));
+            let mut visited = FxHashSet::default();
+
+            const MAX_DEPTH: usize = 8;
+
+            while let Some((lb, depth)) = worklist.pop_front() {
+                if depth > MAX_DEPTH {
+                    continue;
+                }
+                visited.insert(lb);
+                let pred = get_ir_block(lb);
+
+                for next in vcode.block_preds(lb) {
+                    // This does not visit all dominators of the initial block; this is not important for our use case,
+                    // as in most cases, the assumptions from the direct predecessors will suffice.
+                    if !visited.contains(next)
+                        && domtree.dominates(get_ir_block(*next), pred, &f.layout)
+                    {
+                        worklist.push_back((*next, depth + 1));
+                    }
+                }
+
+                let Some(dom_assertions) = f.mem_verifier.block_assertions.get(&pred) else {
+                    continue;
+                };
+
+                // dom dominates block, so we assume all of doms assertions
+                for (reg, assertion) in dom_assertions.iter().flat_map(|(key, assertion)| {
+                    Self::lower_block_assertion(f, value_regs, *key, assertion)
+                }) {
+                    // if lb == bindex, we preserve assertions. Otherwise, convert them to assumptions.
+                    assertions.push((reg, assertion, lb == bindex));
+                }
+            }
+
+            // now we filter out assertions on registers not present in the final vcode
+            let assertions = assertions
+                .into_iter()
+                .filter(|(_, assertion, _)| assertion.is_useful())
+                .filter_map(|(key, assertion, is_assertion)| {
+                    if let RegOrConst::Reg(reg) = key {
+                        let reg = VCodeBuilder::<I>::resolve_vreg_alias_impl(&aliases, reg);
+                        if all_regs.contains(&reg) {
+                            Some((RegOrConst::Reg(reg), assertion, is_assertion))
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some((key, assertion, is_assertion))
+                    }
+                })
+                .map(|(key, assertion, is_assertion)| {
+                    let mut assertion = assertion.clone();
+                    if !is_assertion {
+                        assertion = assertion.to_assumption();
+                    }
+
+                    (key, assertion)
+                });
+            vcode.add_block_assertions(bindex, assertions);
+        }
+    }
+
+    fn lower_block_assertion<'a, 'b>(
+        f: &'a Function,
+        value_regs: &SecondaryMap<Value, ValueRegs<Reg>>,
+        key: ValueOrConst,
+        assertion: &'b ValueAssertion,
+    ) -> Option<(RegOrConst, &'b ValueAssertion)> {
+        let key = match key {
+            ValueOrConst::Const(c) => RegOrConst::Const(c),
+            ValueOrConst::Value(value) => {
+                let reg = || Some(RegOrConst::Reg(value_regs[value].only_reg()?.into()));
+                // If the value is the result of an immediate, we return a const. Otherwise, we try to use
+                // the register the value is stored in.
+                if let ValueDef::Result(inst, _) = f.dfg.value_def(value) {
+                    if let InstructionData::UnaryImm { imm, .. } = f.dfg.insts[inst] {
+                        let imm = imm.bits();
+                        let imm = match f.dfg.value_type(value).bits() {
+                            8 => imm as i8 as u8 as i64,
+                            16 => imm as i16 as u16 as i64,
+                            32 => imm as i32 as u32 as i64,
+                            64 => imm,
+                            width => unimplemented!("Cannot handle type of width {width}"),
+                        };
+                        RegOrConst::Const(imm)
+                    } else {
+                        reg()?
+                    }
+                } else {
+                    reg()?
+                }
+            }
+        };
+
+        Some((key, assertion))
     }
 
     fn add_block_params(&mut self, block: Block) -> CodegenResult<()> {
@@ -978,12 +1122,16 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     }
 
     /// Lower the function.
-    pub fn lower<B: LowerBackend<MInst = I>>(
+    pub fn lower<B: LowerBackend<MInst = I> + TargetIsa>(
         mut self,
         backend: &B,
         ctrl_plane: &mut ControlPlane,
+        domtree: &DominatorTree,
     ) -> CodegenResult<VCode<I>> {
         trace!("about to lower function: {:?}", self.f);
+
+        let mem_verifier_enabled =
+            backend.flags().enable_mem_verifier() && self.f.mem_verifier.enabled;
 
         // Initialize the ABI object, giving it temps if requested.
         let temps = self
@@ -1013,6 +1161,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             .iter()
             .cloned()
             .collect();
+
+        if mem_verifier_enabled {
+            debug_assert!(domtree.is_valid());
+        }
 
         // Main lowering loop over lowered blocks.
         for (bindex, lb) in lowered_order.iter().enumerate().rev() {
@@ -1079,7 +1231,16 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
         // Now that we've emitted all instructions into the
         // VCodeBuilder, let's build the VCode.
-        let vcode = self.vcode.build(self.vregs);
+        let mut vcode = self.vcode.build(self.vregs);
+        if mem_verifier_enabled {
+            Self::lower_block_assertions(
+                &mut vcode,
+                &self.f,
+                &self.value_regs,
+                lowered_order,
+                domtree,
+            );
+        }
         trace!("built vcode: {:?}", vcode);
 
         Ok(vcode)

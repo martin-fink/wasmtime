@@ -2,7 +2,6 @@
 //!
 //! The `Function` struct defined in this module owns all of its basic blocks and
 //! instructions.
-
 use crate::entity::{PrimaryMap, SecondaryMap};
 use crate::ir::{
     self, Block, DataFlowGraph, DynamicStackSlot, DynamicStackSlotData, DynamicStackSlots,
@@ -16,17 +15,20 @@ use crate::HashMap;
 #[cfg(feature = "enable-serde")]
 use alloc::string::String;
 use core::fmt;
+use std::hash::{Hash, Hasher};
 
+use super::entities::UserExternalNameRef;
+use super::extname::UserFuncName;
+use super::{RelSourceLoc, SourceLoc, UserExternalName};
+use crate::fx::{FxHashMap, FxHashSet};
+use crate::mem_verifier::assertions::{ValueAssertion, ValueOrConst};
+use crate::mem_verifier::capability::MemoryAccessCapability;
 #[cfg(feature = "enable-serde")]
 use serde::de::{Deserializer, Error};
 #[cfg(feature = "enable-serde")]
 use serde::ser::Serializer;
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
-
-use super::entities::UserExternalNameRef;
-use super::extname::UserFuncName;
-use super::{RelSourceLoc, SourceLoc, UserExternalName};
 
 /// A version marker used to ensure that serialized clif ir is never deserialized with a
 /// different version of Cranelift.
@@ -144,6 +146,48 @@ impl FunctionParameters {
     }
 }
 
+/// Fields needed for the memory access verifier
+#[derive(Clone, PartialEq)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct MemVerifierIRContext {
+    /// If the memory access verifier is enabled
+    pub enabled: bool,
+
+    /// The capabilities defined in this funtion
+    pub capabilities: FxHashSet<MemoryAccessCapability>,
+
+    /// The annotations defined on instructions in this function
+    pub assertions: FxHashMap<ValueOrConst, ValueAssertion>,
+
+    /// Assertions defined on a block in this function
+    pub block_assertions: FxHashMap<ir::Block, FxHashMap<ValueOrConst, ValueAssertion>>,
+}
+
+impl Hash for MemVerifierIRContext {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // we only hash enabled, as all other items don't have a hash implementation
+        self.enabled.hash(state);
+    }
+}
+
+impl MemVerifierIRContext {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            capabilities: FxHashSet::default(),
+            assertions: FxHashMap::default(),
+            block_assertions: FxHashMap::default(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.enabled = false;
+        self.capabilities.clear();
+        self.assertions.clear();
+        self.block_assertions.clear();
+    }
+}
+
 /// Function fields needed when compiling a function.
 ///
 /// Additionally, these fields can be the same for two functions that would be compiled the same
@@ -193,6 +237,9 @@ pub struct FunctionStencil {
     /// ensure that a trap happens if the stack pointer goes below the
     /// threshold specified here.
     pub stack_limit: Option<ir::GlobalValue>,
+
+    /// The mem verifier data for this function, or None, if disabled
+    pub mem_verifier: MemVerifierIRContext,
 }
 
 impl FunctionStencil {
@@ -205,6 +252,7 @@ impl FunctionStencil {
         self.dfg.clear();
         self.layout.clear();
         self.srclocs.clear();
+        self.mem_verifier.clear();
         self.stack_limit = None;
     }
 
@@ -352,6 +400,38 @@ impl FunctionStencil {
     pub(crate) fn rel_srclocs(&self) -> &SecondaryMap<Inst, RelSourceLoc> {
         &self.srclocs
     }
+
+    /// Adds a new capability
+    pub fn add_capability(&mut self, cap: MemoryAccessCapability) {
+        if self.mem_verifier.enabled {
+            self.mem_verifier.capabilities.insert(cap);
+        }
+    }
+
+    /// Add a new assertion
+    pub fn add_assertion(&mut self, value: ValueOrConst, annotation: ValueAssertion) {
+        let overwritten_assertion = self.mem_verifier.assertions.insert(value, annotation);
+
+        debug_assert!(overwritten_assertion.is_none());
+    }
+
+    /// Add a new assertion at block entry
+    pub fn add_block_assertion(
+        &mut self,
+        block: Block,
+        value: ValueOrConst,
+        annotation: ValueAssertion,
+    ) {
+        let newly_inserted = self
+            .mem_verifier
+            .block_assertions
+            .entry(block)
+            .or_default()
+            .insert(value, annotation);
+
+        // assert we just inserted a new value
+        assert!(newly_inserted.is_none());
+    }
 }
 
 /// Functions can be cloned, but it is not a very fast operation.
@@ -403,6 +483,7 @@ impl Function {
                 layout: Layout::new(),
                 srclocs: SecondaryMap::new(),
                 stack_limit: None,
+                mem_verifier: MemVerifierIRContext::new(),
             },
             params: FunctionParameters::new(),
         }

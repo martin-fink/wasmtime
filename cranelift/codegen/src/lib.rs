@@ -48,6 +48,7 @@ pub mod flowgraph;
 pub mod ir;
 pub mod isa;
 pub mod loop_analysis;
+pub mod mem_verifier;
 pub mod print_errors;
 pub mod settings;
 pub mod timing;

@@ -6,6 +6,8 @@
 use crate::entity::SecondaryMap;
 use crate::ir::entities::AnyEntity;
 use crate::ir::{Block, DataFlowGraph, Function, Inst, SigRef, Type, Value, ValueDef};
+use crate::mem_verifier::assertions::{ValueAssertion, ValueOrConst};
+use crate::mem_verifier::capability::MemoryAccessCapability;
 use crate::packed_option::ReservedValue;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -92,6 +94,11 @@ pub trait FuncWriter {
             self.write_entity_definition(w, func, AnyEntity::StackLimit, &limit)?;
         }
 
+        for cap in &func.mem_verifier.capabilities {
+            any = true;
+            self.write_memory_capability(w, cap)?;
+        }
+
         Ok(any)
     }
 
@@ -104,6 +111,15 @@ pub trait FuncWriter {
         value: &dyn fmt::Display,
     ) -> fmt::Result {
         self.super_entity_definition(w, func, entity, value)
+    }
+
+    /// Write a memory capability defined in the preamble to `w`.
+    fn write_memory_capability(
+        &mut self,
+        w: &mut dyn Write,
+        cap: &MemoryAccessCapability,
+    ) -> fmt::Result {
+        writeln!(w, "    {cap}")
     }
 
     /// Default impl of `write_entity_definition`
@@ -171,6 +187,9 @@ pub fn decorate_function<FW: FuncWriter>(
     w: &mut dyn Write,
     func: &Function,
 ) -> fmt::Result {
+    if func.mem_verifier.enabled {
+        write!(w, "#[verify_memory_accesses]\n")?;
+    }
     write!(w, "function ")?;
     write_spec(w, func)?;
     writeln!(w, " {{")?;
@@ -214,6 +233,19 @@ pub fn write_block_header(
     block: Block,
     indent: usize,
 ) -> fmt::Result {
+    if func.mem_verifier.enabled {
+        if let Some(assertions) = func.mem_verifier.block_assertions.get(&block) {
+            for (value, assertion) in assertions.iter() {
+                write_assertion(w, *value, assertion, indent - 4)?;
+            }
+        }
+        for arg in func.dfg.block_params(block).iter().cloned() {
+            if let Some(assertion) = func.mem_verifier.assertions.get(&arg.into()) {
+                write_assertion(w, arg.into(), assertion, indent - 4)?;
+            }
+        }
+    }
+
     let cold = if func.layout.is_cold(block) {
         " cold"
     } else {
@@ -366,6 +398,26 @@ fn write_instruction(
     for r in func.dfg.inst_results(inst) {
         write_value_aliases(w, aliases, *r, indent)?;
     }
+
+    // Lastly, write all annotations, if there are any
+    for value in func.dfg.inst_results(inst) {
+        if let Some(annotation) = func.mem_verifier.assertions.get(&(*value).into()) {
+            write_assertion(w, (*value).into(), annotation, indent)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Write `assertion` to `w` with a prepended space
+pub fn write_assertion(
+    w: &mut dyn Write,
+    value: ValueOrConst,
+    assertion: &ValueAssertion,
+    indent: usize,
+) -> fmt::Result {
+    writeln!(w, "{1:0$}{2}", indent, "", assertion.display(&value))?;
+
     Ok(())
 }
 

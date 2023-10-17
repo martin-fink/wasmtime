@@ -63,6 +63,15 @@ pub(crate) fn define() -> SettingGroup {
         true,
     );
 
+    settings.add_bool(
+        "enable_mem_verifier",
+        "Run the memory access verifier before register allocation.",
+        r#"
+            This makes compilation slower, but verifies that memory accesses stay within the sandbox.
+        "#,
+        false
+    );
+
     // Note that Cranelift doesn't currently need an is_pie flag, because PIE is
     // just PIC where symbols can't be pre-empted, which can be expressed with the
     // `colocated` flag on external functions and global values.

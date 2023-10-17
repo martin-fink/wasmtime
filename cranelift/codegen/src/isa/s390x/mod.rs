@@ -21,7 +21,11 @@ use target_lexicon::{Architecture, Triple};
 mod abi;
 pub(crate) mod inst;
 mod lower;
+pub mod mem_verifier;
 mod settings;
+
+use crate::isa::s390x::mem_verifier::S390xMemAccessVerifier;
+use inst::create_machine_env;
 
 use self::inst::EmitInfo;
 
@@ -57,7 +61,10 @@ impl S390xBackend {
         let emit_info = EmitInfo::new(self.isa_flags.clone());
         let sigs = SigSet::new::<abi::S390xMachineDeps>(func, &self.flags)?;
         let abi = abi::S390xCallee::new(func, self, &self.isa_flags, &sigs)?;
-        compile::compile::<S390xBackend>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
+        let verifier = S390xMemAccessVerifier::new();
+        compile::compile::<S390xBackend>(
+            func, domtree, self, abi, emit_info, sigs, ctrl_plane, &verifier,
+        )
     }
 }
 
