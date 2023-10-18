@@ -779,16 +779,6 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                         self.set_vreg_alias(*dst, *temp);
                     }
                 }
-
-                debug_assert_eq!(temp_regs.len(), self.f.dfg.inst_results(inst).len());
-                for (i, val) in self.f.dfg.inst_results(inst).iter().enumerate() {
-                    if let Some(annotation) = self.f.mem_verifier.assertions.get(&(*val).into()) {
-                        let regs = temp_regs[i];
-                        for reg in regs.regs().iter() {
-                            self.vcode.add_assertion(*reg, annotation);
-                        }
-                    }
-                }
             }
 
             let loc = self.srcloc(inst);

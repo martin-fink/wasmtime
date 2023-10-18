@@ -239,11 +239,6 @@ pub fn write_block_header(
                 write_assertion(w, *value, assertion, indent - 4)?;
             }
         }
-        for arg in func.dfg.block_params(block).iter().cloned() {
-            if let Some(assertion) = func.mem_verifier.assertions.get(&arg.into()) {
-                write_assertion(w, arg.into(), assertion, indent - 4)?;
-            }
-        }
     }
 
     let cold = if func.layout.is_cold(block) {
@@ -397,13 +392,6 @@ fn write_instruction(
     // Value aliases come out on lines after the instruction defining the referent.
     for r in func.dfg.inst_results(inst) {
         write_value_aliases(w, aliases, *r, indent)?;
-    }
-
-    // Lastly, write all annotations, if there are any
-    for value in func.dfg.inst_results(inst) {
-        if let Some(annotation) = func.mem_verifier.assertions.get(&(*value).into()) {
-            write_assertion(w, (*value).into(), annotation, indent)?;
-        }
     }
 
     Ok(())

@@ -156,9 +156,6 @@ pub struct MemVerifierIRContext {
     /// The capabilities defined in this funtion
     pub capabilities: FxHashSet<MemoryAccessCapability>,
 
-    /// The annotations defined on instructions in this function
-    pub assertions: FxHashMap<ValueOrConst, ValueAssertion>,
-
     /// Assertions defined on a block in this function
     pub block_assertions: FxHashMap<ir::Block, FxHashMap<ValueOrConst, ValueAssertion>>,
 }
@@ -175,7 +172,6 @@ impl MemVerifierIRContext {
         Self {
             enabled: false,
             capabilities: FxHashSet::default(),
-            assertions: FxHashMap::default(),
             block_assertions: FxHashMap::default(),
         }
     }
@@ -183,7 +179,6 @@ impl MemVerifierIRContext {
     fn clear(&mut self) {
         self.enabled = false;
         self.capabilities.clear();
-        self.assertions.clear();
         self.block_assertions.clear();
     }
 }
@@ -406,13 +401,6 @@ impl FunctionStencil {
         if self.mem_verifier.enabled {
             self.mem_verifier.capabilities.insert(cap);
         }
-    }
-
-    /// Add a new assertion
-    pub fn add_assertion(&mut self, value: ValueOrConst, annotation: ValueAssertion) {
-        let overwritten_assertion = self.mem_verifier.assertions.insert(value, annotation);
-
-        debug_assert!(overwritten_assertion.is_none());
     }
 
     /// Add a new assertion at block entry
